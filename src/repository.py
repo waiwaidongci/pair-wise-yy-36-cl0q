@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import (ConflictError, NotFoundError, STATES)
 
 
 class Repository:
@@ -26,33 +25,55 @@ class Repository:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
         with self.conn:
             self.conn.executescript(f"""
-                CREATE TABLE IF NOT EXISTS items (
+                CREATE TABLE IF NOT EXISTS cases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    quantity REAL NOT NULL DEFAULT 0,
-                    threshold REAL NOT NULL DEFAULT 1,
+                    outfall TEXT NOT NULL,
+                    sampling_time TEXT NOT NULL,
+                    instant_value REAL,
+                    daily_value REAL,
+                    instant_limit REAL,
+                    daily_limit REAL,
+                    facility_state TEXT NOT NULL
+                        CHECK(facility_state IN ('running','shutdown')),
+                    calibrated_until TEXT,
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
+                    revision INTEGER NOT NULL DEFAULT 1,
                     version INTEGER NOT NULL DEFAULT 1,
+                    flags TEXT NOT NULL DEFAULT '[]',
+                    registered_by TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_result TEXT,
+                    review_note TEXT,
+                    closed_by TEXT,
+                    closed_at TEXT,
                     external_ref TEXT,
-                    created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(outfall, sampling_time)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
-                    ON items(external_ref) WHERE external_ref IS NOT NULL;
-                CREATE TABLE IF NOT EXISTS records (
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_cases_external_ref
+                    ON cases(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS case_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL,
+                    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('note','rectification','retest')),
                     detail TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
-                    external_ref TEXT,
                     created_by TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(item_id, external_ref)
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS case_archives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('review','closure')),
+                    result TEXT,
+                    actor TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,37 +88,46 @@ class Repository:
                 );
             """)
 
-    @staticmethod
-    def _item(row: sqlite3.Row) -> Dict[str, Any]:
-        return dict(row)
+    # ---------- cases ----------
 
-    def create_item(self, title: str, description: str, severity: str,
-                    quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+    @staticmethod
+    def _case(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["flags"] = json.loads(item["flags"] or "[]")
+        return item
+
+    def create_case(self, data: Dict[str, Any], actor: str) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
-                    """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                    """INSERT INTO cases(outfall, sampling_time, instant_value, daily_value,
+                       instant_limit, daily_limit, facility_state, calibrated_until,
+                       status, revision, version, flags, registered_by,
+                       external_ref, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (data["outfall"], data["sampling_time"], data["instant_value"],
+                     data["daily_value"], data["instant_limit"], data["daily_limit"],
+                     data["facility_state"], data["calibrated_until"], data["status"],
+                     1, 1, json.dumps(data["flags"], ensure_ascii=False), actor,
+                     data.get("external_ref"), now, now),
                 )
-                item_id = int(cur.lastrowid)
+                case_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
-            raise ConflictError("external_ref已存在") from exc
-        return self.get_item(item_id)
+            if "external_ref" in str(exc):
+                raise ConflictError("external_ref已存在") from exc
+            raise ConflictError("同一排放口同一采样时刻的读数已登记，仅保留首条") from exc
+        return self.get_case(case_id)
 
-    def get_item(self, item_id: int) -> Dict[str, Any]:
+    def get_case(self, case_id: int) -> Dict[str, Any]:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            row = self.conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
         if row is None:
-            raise NotFoundError("项目不存在")
-        return self._item(row)
+            raise NotFoundError("核查记录不存在")
+        return self._case(row)
 
-    def list_items(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM items"
+    def list_cases(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM cases"
         params: tuple = ()
         if status:
             sql += " WHERE status=?"
@@ -105,57 +135,150 @@ class Repository:
         sql += " ORDER BY id DESC"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
-        return [self._item(row) for row in rows]
+        return [self._case(row) for row in rows]
 
-    def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+    def update_case_decision(self, case_id: int, status: str, expected_version: int,
+                             fields: Dict[str, Any], actor: str) -> Dict[str, Any]:
+        """带版本号的状态推进（复核/结案）。"""
+        now = utc_now()
+        sets = ["status=?", "version=version+1", "updated_at=?"]
+        params: List[Any] = [status, now]
+        for key, value in fields.items():
+            sets.append(f"{key}=?")
+            params.append(value)
+        params.extend([case_id, expected_version])
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                f"UPDATE cases SET {', '.join(sets)} WHERE id=? AND version=?",
+                tuple(params),
+            )
+            if cur.rowcount == 0:
+                if self.conn.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone() is None:
+                    raise NotFoundError("核查记录不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_case(case_id)
+
+    def apply_correction(self, case_id: int, status: str, expected_version: int,
+                         fields: Dict[str, Any], flags: List[str], actor: str) -> Dict[str, Any]:
+        """限值/工况更正：revision递增，强制回到待复核，复核/结案资格失效。"""
         now = utc_now()
         with self._lock, self.conn:
             cur = self.conn.execute(
-                """UPDATE items SET status=?, version=version+1, updated_at=?
+                """UPDATE cases SET status=?, revision=revision+1, version=version+1,
+                   flags=?, instant_limit=?, daily_limit=?, facility_state=?,
+                   reviewed_by=NULL, reviewed_at=NULL, review_result=NULL, review_note=NULL,
+                   closed_by=NULL, closed_at=NULL, updated_at=?
                    WHERE id=? AND version=?""",
-                (target, now, item_id, expected_version),
+                (status, json.dumps(flags, ensure_ascii=False),
+                 fields["instant_limit"], fields["daily_limit"], fields["facility_state"],
+                 now, case_id, expected_version),
             )
             if cur.rowcount == 0:
-                exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
-                if exists is None:
-                    raise NotFoundError("项目不存在")
+                if self.conn.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone() is None:
+                    raise NotFoundError("核查记录不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
-        return self.get_item(item_id)
+        return self.get_case(case_id)
 
-    def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+    # ---------- records ----------
+
+    def add_record(self, case_id: int, kind: str, detail: dict, status: str,
+                   actor: str) -> Dict[str, Any]:
         now = utc_now()
-        self.get_item(item_id)
-        try:
-            with self._lock, self.conn:
-                cur = self.conn.execute(
-                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
-                )
-                record_id = int(cur.lastrowid)
-        except sqlite3.IntegrityError as exc:
-            raise ConflictError("记录唯一标识已存在") from exc
-        with self._lock:
-            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
-        return dict(row)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO case_records(case_id, kind, detail, status, created_by, created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (case_id, kind, json.dumps(detail, ensure_ascii=False), status, actor, now),
+            )
+            record_id = int(cur.lastrowid)
+        return self.get_record(record_id)
 
-    def list_records(self, item_id: int) -> List[Dict[str, Any]]:
-        self.get_item(item_id)
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM records WHERE item_id=? ORDER BY id", (item_id,)
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def open_record_count(self, item_id: int) -> int:
+    def get_record(self, record_id: int) -> Dict[str, Any]:
         with self._lock:
             row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status='open'",
-                (item_id,),
+                "SELECT * FROM case_records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("附随记录不存在")
+        item = dict(row)
+        item["detail"] = json.loads(item["detail"])
+        return item
+
+    def list_records(self, case_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM case_records WHERE case_id=? ORDER BY id", (case_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item["detail"])
+            result.append(item)
+        return result
+
+    def close_record(self, record_id: int, actor: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE case_records SET status='closed' WHERE id=? AND status='open'",
+                (record_id,),
+            )
+            if cur.rowcount == 0:
+                if self.conn.execute("SELECT 1 FROM case_records WHERE id=?", (record_id,)).fetchone() is None:
+                    raise NotFoundError("附随记录不存在")
+                raise ConflictError("该事项已关闭")
+        return self.get_record(record_id)
+
+    def open_rectification_count(self, case_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM case_records WHERE case_id=? AND kind='rectification' AND status='open'",
+                (case_id,),
             ).fetchone()
         return int(row["n"])
+
+    def latest_retest(self, case_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM case_records WHERE case_id=? AND kind='retest'
+                   ORDER BY id DESC LIMIT 1""",
+                (case_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["detail"] = json.loads(item["detail"])
+        return item
+
+    # ---------- archives ----------
+
+    def archive(self, case_id: int, kind: str, snapshot: dict, actor: str,
+                revision: int, result: Optional[str] = None,
+                reason: Optional[str] = None) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO case_archives(case_id, kind, result, actor, revision,
+                   snapshot, reason, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (case_id, kind, result, actor, revision,
+                 json.dumps(snapshot, ensure_ascii=False, sort_keys=True), reason, now),
+            )
+            archive_id = int(cur.lastrowid)
+        return {"id": archive_id, "case_id": case_id, "kind": kind, "result": result,
+                "actor": actor, "revision": revision, "snapshot": snapshot,
+                "reason": reason, "created_at": now}
+
+    def list_archives(self, case_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM case_archives WHERE case_id=? ORDER BY id", (case_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item["snapshot"])
+            result.append(item)
+        return result
+
+    # ---------- audit ----------
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
@@ -172,8 +295,7 @@ class Repository:
                  json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
                  event["previous_hash"], event["entry_hash"], event["created_at"]),
             )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
+            event["id"] = int(cur.lastrowid)
         return event
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:

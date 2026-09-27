@@ -1,1 +1,277 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业排污许可与超标处置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>企业排污许可与超标处置</h1><p>汇总监测和工况，判断排放超标并跟踪复测、整改、执法与复查</p><p>按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>排放核查台</title>
+<style>
+:root{--bd:#d7dee5;--mut:#667684;--ok:#1a7f4b;--warn:#b26a00;--bad:#b3261e;--info:#1f5fa8}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f3f6f8;color:#17212b}
+header{background:#0f3d5c;color:#fff;padding:.8rem 1.2rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+header h1{font-size:1.15rem;margin:0}
+.wrap{max-width:1180px;margin:1.2rem auto;padding:0 1rem}
+.card{background:#fff;border:1px solid var(--bd);border-radius:8px;padding:1rem;margin-bottom:1rem}
+.card h2{font-size:1rem;margin:0 0 .8rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem}
+label{font-size:.78rem;color:var(--mut);display:flex;flex-direction:column;gap:.25rem}
+input,select,textarea{font:inherit;padding:.4rem .5rem;border:1px solid var(--bd);border-radius:5px;background:#fff}
+button{font:inherit;padding:.42rem .75rem;border:1px solid #0f3d5c;background:#0f3d5c;color:#fff;border-radius:5px;cursor:pointer}
+button.sec{background:#fff;color:#0f3d5c}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse;font-size:.83rem}
+th,td{border-bottom:1px solid var(--bd);padding:.5rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef3f6;font-weight:600;white-space:nowrap}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:99px;font-size:.75rem;font-weight:600;white-space:nowrap}
+.t-registered{background:#e9edf0;color:#45545f}
+.t-pending{background:#fdeecf;color:var(--warn)}
+.t-reviewed{background:#dff3e8;color:var(--ok)}
+.t-remediation{background:#e4eefb;color:var(--info)}
+.t-closed{background:#e3e7ea;color:#333}
+.major{color:var(--bad);font-weight:700}
+.over{color:var(--bad);font-weight:700}
+.mut{color:var(--mut);font-size:.76rem}
+ul.reasons{margin:.2rem 0 0;padding-left:1.1rem}
+ul.reasons li{color:var(--bad)}
+.toast{position:fixed;right:1rem;bottom:1rem;background:#222;color:#fff;padding:.6rem .9rem;border-radius:6px;font-size:.85rem;max-width:420px;display:none;white-space:pre-wrap}
+dialog{border:1px solid var(--bd);border-radius:8px;padding:1.1rem;width:min(560px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+.arch{border-left:3px solid var(--bd);padding:.35rem .7rem;margin:.5rem 0;background:#f8fafb;font-size:.8rem}
+.arch b{color:var(--bad)}
+.pill{font-size:.7rem;padding:.05rem .4rem;border:1px solid var(--bd);border-radius:99px;color:var(--mut)}
+code{background:#eef1f3;padding:.05rem .3rem;border-radius:3px}
+</style>
+</head>
+<body>
+<header>
+  <h1>排放核查台</h1>
+  <span class="mut" style="color:#cfe0ec">瞬时波动与日均超标分开判定 · 停机/校准过期数据单独复核 · 更正后旧结论留档失效</span>
+  <span style="flex:1"></span>
+  <label style="color:#cfe0ec">操作人<input id="actor" value="zhang" style="min-width:110px"></label>
+  <label style="color:#cfe0ec">角色
+    <select id="role">
+      <option value="operator">operator 运维</option>
+      <option value="compliance_officer" selected>compliance_officer 合规</option>
+      <option value="director">director 负责人</option>
+      <option value="viewer">viewer 查看</option>
+    </select>
+  </label>
+  <button class="sec" onclick="load()">刷新</button>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>登记读数（同一排放口 + 同一采样时刻仅保留首条）</h2>
+    <form id="regForm" class="grid">
+      <label>排放口编号<input name="outfall" required placeholder="DW001"></label>
+      <label>采样时刻<input name="sampling_time" type="datetime-local" step="1" required></label>
+      <label>瞬时浓度 mg/L<input name="instant_value" type="number" step="any" placeholder="可空"></label>
+      <label>日均浓度 mg/L<input name="daily_value" type="number" step="any" placeholder="可空"></label>
+      <label>瞬时许可限值<input name="instant_limit" type="number" step="any" value="50" required></label>
+      <label>日均许可限值<input name="daily_limit" type="number" step="any" value="30" required></label>
+      <label>治污设施状态
+        <select name="facility_state"><option value="running">running 运行</option><option value="shutdown">shutdown 停机</option></select>
+      </label>
+      <label>仪器校准有效期至<input name="calibrated_until" type="datetime-local" step="1"></label>
+      <label>外部编号(可空)<input name="external_ref" placeholder="可空"></label>
+      <label style="justify-content:end"><button type="submit">登记</button></label>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:.6rem">
+      <h2 style="margin:0">核查列表</h2>
+      <select id="filter" onchange="load()">
+        <option value="">全部状态</option>
+        <option value="registered">已登记</option>
+        <option value="pending">待复核</option>
+        <option value="reviewed">已复核</option>
+        <option value="remediation">整改中</option>
+        <option value="closed">已结案</option>
+      </select>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>#</th><th>排放口</th><th>采样时刻</th><th>瞬时 浓度/限值</th><th>日均 浓度/限值</th>
+          <th>设施</th><th>校准</th><th>当前状态</th><th>阻断原因 / 待办</th><th>操作</th>
+        </tr></thead>
+        <tbody id="rows"><tr><td colspan="10" class="mut">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<dialog id="dlg"><form method="dialog" id="dlgForm">
+  <h3 id="dlgTitle" style="margin-top:0"></h3>
+  <div id="dlgBody"></div>
+  <div class="row" style="margin-top:1rem;justify-content:flex-end">
+    <button type="button" class="sec" onclick="dlg.close()">取消</button>
+    <button type="button" id="dlgOk">确定</button>
+  </div>
+</form></dialog>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+let CASES=[];
+function hdr(){return {'Content-Type':'application/json','X-Actor':$('#actor').value.trim()||'anon','X-Role':$('#role').value}}
+function toast(m,err){const t=$('#toast');t.textContent=m;t.style.background=err?'#7a1f1a':'#222';t.style.display='block';clearTimeout(t._t);t._t=setTimeout(()=>t.style.display='none',4200)}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function fv(v){return v===null||v===undefined?'-':v}
+function isOfficer(){return $('#role').value==='compliance_officer'}
+function isStaff(){return ['operator','compliance_officer'].includes($('#role').value)}
+
+async function api(path,opt){
+  const r=await fetch(path,Object.assign({headers:hdr()},opt));
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.message||('HTTP '+r.status));
+  return j;
+}
+async function load(){
+  try{
+    const st=$('#filter').value;
+    const j=await api('/api/cases'+(st?('?status='+st):''));
+    CASES=j.cases;render();
+  }catch(e){toast(e.message,true)}
+}
+function render(){
+  const tb=$('#rows');
+  if(!CASES.length){tb.innerHTML='<tr><td colspan="10" class="mut">暂无记录</td></tr>';return}
+  tb.innerHTML=CASES.map(c=>{
+    const instOver=isOver(c.instant_value,c.instant_limit), dailyOver=isOver(c.daily_value,c.daily_limit);
+    const calExp=c.flags.includes('calibration_expired');
+    return `<tr>
+      <td>${c.id}<div class="mut">rev ${c.revision}${c.external_ref?('<br>'+esc(c.external_ref)):''}</div></td>
+      <td><b>${esc(c.outfall)}</b><div class="mut">登记 ${esc(c.registered_by)}</div></td>
+      <td>${esc(c.sampling_time.replace('T',' ').replace('+00:00','Z'))}</td>
+      <td class="${instOver?'over':''}">${fv(c.instant_value)} / ${c.instant_limit}</td>
+      <td class="${dailyOver?'over major':''}">${fv(c.daily_value)} / ${c.daily_limit}${c.major?' <span class="pill">重大</span>':''}</td>
+      <td>${c.facility_state==='shutdown'?'<span class="over">停机</span>':'运行'}</td>
+      <td class="${calExp?'over':''}">${c.calibrated_until?(esc(c.calibrated_until.replace('T',' ').replace('+00:00','Z'))+(calExp?' 已过期':'')):'-'}</td>
+      <td><span class="tag t-${c.status}">${c.status_label}</span>
+          <div class="mut">v${c.version}${c.reviewed_by?('<br>复核 '+esc(c.reviewed_by)):''}</div></td>
+      <td><ul class="reasons">${(c.blockers||[]).map(b=>'<li>'+esc(b)+'</li>').join('')}</ul></td>
+      <td>${actions(c).join(' ')}</td>
+    </tr>`;
+  }).join('');
+}
+function isOver(v,l){return v!==null&&v!==undefined&&l>0&&v>l}
+function actions(c){
+  const a=[];
+  a.push(`<button class="sec" onclick="showDetail(${c.id})">详情/留档</button>`);
+  if(c.status==='pending'&&isOfficer())
+    a.push(`<button onclick="openReview(${c.id})">复核确认</button>`);
+  if(c.status==='remediation'&&isStaff()){
+    a.push(`<button class="sec" onclick="openRect(${c.id})">整改项</button>`);
+    a.push(`<button class="sec" onclick="openRetest(${c.id})">复测</button>`);
+  }
+  if(c.status==='remediation'&&isOfficer())
+    a.push(`<button onclick="closeCase(${c.id},${c.version})">结案</button>`);
+  if(isOfficer()&&c.status!=='pending')
+    a.push(`<button class="sec" onclick="openCorrect(${c.id})">限值/工况更正</button>`);
+  return a;
+}
+
+/* ---------- dialogs ---------- */
+const dlg=$('#dlg');
+function openDlg(title,html,onOk){
+  $('#dlgTitle').textContent=title;$('#dlgBody').innerHTML=html;
+  const ok=$('#dlgOk');ok.onclick=async()=>{try{await onOk();dlg.close();await load()}catch(e){toast(e.message,true)}};
+  dlg.showModal();
+}
+function openReview(id){
+  const c=CASES.find(x=>x.id===id);
+  openDlg(`#${id} 复核确认（须由登记人 ${esc(c.registered_by)} 之外的合规人员）`,`
+    <p class="mut">触发：${c.flag_labels.map(esc).join('；')||'无'}</p>
+    <label>复核结论
+      <select id="rv">
+        <option value="exceedance">exceedance 确认超标</option>
+        <option value="transient">transient 瞬时波动（不构成日均超标）</option>
+        <option value="invalid_data">invalid_data 数据无效（停机/校准过期）</option>
+      </select></label>
+    <label style="margin-top:.6rem">说明<textarea id="rn" rows="3"></textarea></label>`,
+    ()=>api(`/api/cases/${id}/review`,{method:'POST',body:JSON.stringify({
+      result:$('#rv').value,note:$('#rn').value,expected_version:c.version})}));
+}
+function openRect(id){
+  const c=CASES.find(x=>x.id===id);
+  openDlg(`#${id} 整改事项（关闭后才允许结案）`,`
+    <label>事项标题<input id="rt"></label>
+    <label style="margin-top:.6rem">说明<textarea id="rd" rows="2"></textarea></label>`,
+    ()=>api(`/api/cases/${id}/records`,{method:'POST',body:JSON.stringify({
+      kind:'rectification',title:$('#rt').value,description:$('#rd').value})}));
+}
+function openRetest(id){
+  const c=CASES.find(x=>x.id===id);
+  openDlg(`#${id} 复测登记（对照当前限值：瞬时 ${c.instant_limit} / 日均 ${c.daily_limit}）`,`
+    <div class="grid">
+      <label>复测瞬时浓度<input id="ri" type="number" step="any"></label>
+      <label>复测日均浓度<input id="rd2" type="number" step="any"></label>
+    </div>
+    <label style="margin-top:.6rem">备注<textarea id="rn2" rows="2"></textarea></label>`,
+    ()=>api(`/api/cases/${id}/records`,{method:'POST',body:JSON.stringify({
+      kind:'retest',instant_value:$('#ri').value||null,daily_value:$('#rd2').value||null,
+      note:$('#rn2').value||null})}));
+}
+function openCorrect(id){
+  const c=CASES.find(x=>x.id===id);
+  openDlg(`#${id} 限值/工况更正（原复核/结案立即失效，回到待复核，旧结论留档）`,`
+    <div class="grid">
+      <label>瞬时许可限值<input id="ci" type="number" step="any" value="${c.instant_limit}"></label>
+      <label>日均许可限值<input id="cd" type="number" step="any" value="${c.daily_limit}"></label>
+      <label>治污设施状态<select id="cf"><option value="running" ${c.facility_state==='running'?'selected':''}>运行</option><option value="shutdown" ${c.facility_state==='shutdown'?'selected':''}>停机</option></select></label>
+    </div>
+    <label style="margin-top:.6rem">更正原因<textarea id="cr" rows="2"></textarea></label>`,
+    ()=>api(`/api/cases/${id}/correct`,{method:'POST',body:JSON.stringify({
+      instant_limit:$('#ci').value,daily_limit:$('#cd').value,facility_state:$('#cf').value,
+      reason:$('#cr').value,expected_version:c.version})}));
+}
+function closeCase(id,v){
+  if(!confirm('确认结案？需复测达标且整改事项全部关闭。'))return;
+  api(`/api/cases/${id}/close`,{method:'POST',body:JSON.stringify({expected_version:v})})
+    .then(load).catch(e=>toast(e.message,true));
+}
+async function showDetail(id){
+  try{
+    const [c,recs,arch] = await Promise.all([
+      api(`/api/cases/${id}`),api(`/api/cases/${id}/records`),api(`/api/cases/${id}/archives`)]);
+    const recHtml=(recs.records||[]).map(r=>{
+      const d=r.detail;
+      const text=r.kind==='note'?esc(d.text):r.kind==='rectification'
+        ?esc(d.title)+(d.description?(' — '+esc(d.description)):'')
+        :`复测 瞬时=${fv(d.instant_value)} 日均=${fv(d.daily_value)}`+(d.note?(' ('+esc(d.note)+')'):'');
+      const canClose=r.kind==='rectification'&&r.status==='open'&&isStaff();
+      return `<div class="arch"><span class="pill">${r.kind}</span> ${text}
+        <span class="mut">[${r.status}] ${esc(r.created_by)} ${esc(r.created_at.replace('T',' ').replace('+00:00','Z'))}</span>
+        ${canClose?`<button class="sec" style="float:right" onclick="closeRec(${id},${r.id})">关闭事项</button>`:''}</div>`;
+    }).join('')||'<p class="mut">无附随记录</p>';
+    const archHtml=(arch.archives||[]).map(a=>`
+      <div class="arch"><b>[${a.kind==='review'?'原复核留档':'原结案留档'}]</b>
+        ${a.result?('结论 <code>'+a.result+'</code>'):''}
+        rev ${a.revision} · ${esc(a.actor)} · ${esc(a.created_at.replace('T',' ').replace('+00:00','Z'))}
+        ${a.reason?('<br>失效原因：'+esc(a.reason)):''}
+        <div class="mut">快照：${esc(JSON.stringify(a.snapshot))}</div></div>`).join('')||'<p class="mut">暂无旧结论留档</p>';
+    openDlg(`#${id} 详情 · ${esc(c.outfall)} · ${esc(c.sampling_time)}`,
+      `<h4>附随记录（整改 / 复测 / 备注）</h4>${recHtml}<h4>旧结论留档</h4>${archHtml}`,()=>{});
+  }catch(e){toast(e.message,true)}
+}
+async function closeRec(cid,rid){
+  try{await api(`/api/cases/${cid}/records/${rid}/close`,{method:'POST'});dlg.close();await load();toast('整改事项已关闭')}
+  catch(e){toast(e.message,true)}
+}
+
+/* ---------- register ---------- */
+$('#regForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const fd=new FormData(e.target);const p={};
+  for(const [k,v] of fd.entries())p[k]=v===''?null:v;
+  if(p.sampling_time)p.sampling_time=p.sampling_time.length===16?p.sampling_time+':00':p.sampling_time;
+  try{await api('/api/cases',{method:'POST',body:JSON.stringify(p)});e.target.reset();await load();toast('登记成功')}
+  catch(err){toast(err.message,true)}
+});
+load();
+</script>
+</body>
+</html>
